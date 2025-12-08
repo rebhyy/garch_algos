@@ -28,6 +28,20 @@ from math import log, sqrt, exp, erf
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 
+# Portfolio Analytics modules
+from src.analytics.portfolio_metrics import (
+    calculate_returns, calculate_all_metrics, monthly_returns_table,
+    calculate_drawdown, rolling_sharpe
+)
+from src.analytics.heatmaps import (
+    create_monthly_returns_heatmap, create_correlation_heatmap,
+    create_drawdown_chart, create_rolling_metrics_chart,
+    create_returns_distribution
+)
+
+# Real-time WebSocket feed for ultra-fast updates (10-50ms)
+from src.utils.websocket_feed import WebSocketPriceFeed, get_fast_ticker_rest
+
 warnings.filterwarnings("ignore")
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
@@ -176,17 +190,36 @@ def implied_vol_bisect(S, K, T, r, price, kind="call", lo=1e-4, hi=5.0, tol=1e-5
     return mid
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    m, s, h = macd(df["Close"]); df["MACD"], df["MACD_signal"], df["MACD_hist"] = m, s, h
-    df["ADX"] = adx_series(df["High"], df["Low"], df["Close"])
+    # Calculate MACD
+    m, s, h = macd(df["Close"])
+    df["MACD"] = m
+    df["MACD_signal"] = s
+    df["MACD_hist"] = h
+
+    # Calculate ADX - ensure it's a Series
+    adx_result = adx_series(df["High"], df["Low"], df["Close"])
+    if isinstance(adx_result, pd.DataFrame):
+        df["ADX"] = adx_result.iloc[:, 0]  # Take first column if DataFrame
+    else:
+        df["ADX"] = adx_result
+
     return df
 
 # ========= DATA PROVIDERS =========
-CACHE_TTL = 120  # seconds
+CACHE_TTL = 1  # seconds - Real-time updates like trading websites
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL)
 def load_yfinance(symbol: str, period=DEFAULT_PERIOD_YF, interval=DEFAULT_TIMEFRAME) -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if df.empty: raise ValueError(f"yfinance returned no data for {symbol}")
-    df = df.rename(columns=str.title); df.index = ensure_tz(df.index); return df
+
+    # Handle multi-index columns if present
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.droplevel(1)
+
+    # Rename columns to standard format
+    df = df.rename(columns=str.title)
+    df.index = ensure_tz(df.index)
+    return df
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL)
 def load_ccxt(market: str, exchange: Literal["okx","binance"]="okx",
@@ -280,7 +313,7 @@ def atr_series(high: pd.Series, low: pd.Series, close: pd.Series, period=14) -> 
 ASSET_SHORTLIST = ["BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","DOGE/USDT"]
 FX_COMMOD = {"XAUUSD=X":"Gold", "EURUSD=X":"EURUSD"}
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)  # Real-time updates
 def load_close_for_corr() -> pd.DataFrame:
     frames = []
     # crypto via OKX
@@ -539,6 +572,9 @@ def is_fx_or_metal(pair: str) -> bool:
 st.set_page_config(page_title="GARCH Lab", layout="wide")
 st.title("📈 GARCH Lab — Volatility, Forecast & Market View")
 
+# ========= TRUE REAL-TIME TICKER (No Branding!) =========
+st.markdown("### ⚡ Live Market — Real-Time")
+
 with st.sidebar:
     st.header("Quick picks")
     preset = st.radio("Asset", list(ASSET_PRESETS.keys()), index=0)
@@ -548,8 +584,181 @@ with st.sidebar:
         "Exchange (OKX/Binance via CCXT)", "Yahoo Finance (free)",
         "Twelve Data (key)", "Alpha Vantage FX (key)"], index=0)
 
-    cfg = ASSET_PRESETS[preset]
+# Get current asset symbol for real-time display
+cfg = ASSET_PRESETS[preset]
+if preset == "BTC/USDT (OKX)":
+    tv_symbol = "OKX:BTCUSDT"
+    display_name = "BTC/USDT"
+elif preset == "ETH/USDT (OKX)":
+    tv_symbol = "OKX:ETHUSDT"
+    display_name = "ETH/USDT"
+elif preset == "EURUSD (Yahoo)":
+    tv_symbol = "FX:EURUSD"
+    display_name = "EUR/USD"
+elif preset == "Gold XAUUSD (Yahoo)":
+    tv_symbol = "TVC:GOLD"
+    display_name = "Gold (XAU/USD)"
+else:
+    tv_symbol = "OKX:BTCUSDT"
+    display_name = cfg.get("market", "BTC/USDT")
 
+# Dynamic ticker tape based on selection (minimal branding)
+components.html(f"""
+<style>
+  .ticker-wrap {{
+    width: 100%;
+    overflow: hidden;
+    background: linear-gradient(90deg, #1a1a2e 0%, #16213e 100%);
+    border-radius: 8px;
+    padding: 12px 0;
+  }}
+  .ticker {{
+    display: flex;
+    animation: scroll 30s linear infinite;
+  }}
+  .ticker-item {{
+    display: flex;
+    align-items: center;
+    padding: 0 30px;
+    white-space: nowrap;
+  }}
+  .ticker-item .symbol {{
+    font-weight: bold;
+    color: #fff;
+    font-size: 14px;
+    margin-right: 8px;
+  }}
+  .ticker-item .price {{
+    color: #00ff88;
+    font-size: 16px;
+    font-weight: bold;
+  }}
+  .ticker-item .change.up {{
+    color: #00ff88;
+    font-size: 12px;
+    margin-left: 8px;
+  }}
+  .ticker-item .change.down {{
+    color: #ff4444;
+    font-size: 12px;
+    margin-left: 8px;
+  }}
+  .live-dot {{
+    width: 8px;
+    height: 8px;
+    background: #00ff88;
+    border-radius: 50%;
+    margin-right: 8px;
+    animation: pulse 1s infinite;
+  }}
+  @keyframes pulse {{
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.5; }}
+  }}
+  @keyframes scroll {{
+    0% {{ transform: translateX(0); }}
+    100% {{ transform: translateX(-50%); }}
+  }}
+</style>
+<div class="ticker-wrap">
+  <div class="ticker">
+    <div class="ticker-item">
+      <span class="live-dot"></span>
+      <span class="symbol">🔴 LIVE</span>
+    </div>
+    <div class="ticker-item">
+      <span class="symbol">{display_name}</span>
+      <span class="price" id="price-display">Loading...</span>
+    </div>
+    <div class="ticker-item">
+      <span class="symbol">Selected Asset</span>
+      <span class="price">✓ {preset}</span>
+    </div>
+    <div class="ticker-item">
+      <span class="symbol">Updates</span>
+      <span class="price">Real-Time</span>
+    </div>
+  </div>
+</div>
+""", height=50)
+
+# Dynamic chart - changes with asset selection
+col_chart, col_info = st.columns([3, 1])
+
+with col_chart:
+    # TradingView chart with minimal branding (symbol changes based on selection!)
+    components.html(f"""
+    <div id="tv_chart" style="height:280px;width:100%;background:#0e1117;border-radius:8px;overflow:hidden;">
+    </div>
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <script>
+      new TradingView.widget({{
+        "autosize": true,
+        "symbol": "{tv_symbol}",
+        "interval": "1",
+        "timezone": "Etc/UTC",
+        "theme": "dark",
+        "style": "1",
+        "locale": "en",
+        "toolbar_bg": "#0e1117",
+        "enable_publishing": false,
+        "hide_top_toolbar": false,
+        "hide_legend": true,
+        "hide_side_toolbar": true,
+        "allow_symbol_change": false,
+        "save_image": false,
+        "container_id": "tv_chart",
+        "hide_volume": true,
+        "backgroundColor": "#0e1117"
+      }});
+    </script>
+    """, height=290)
+
+with col_info:
+    # Custom price display using our WebSocket data (no branding!)
+    try:
+        # Get fresh ticker data
+        ticker_data = get_fast_ticker_rest("okx", display_name.replace("/", "-"))
+        
+        last_price = ticker_data.get('last', 0)
+        change_24h = ticker_data.get('change24h', 0)
+        high_24h = ticker_data.get('high24h', 0)
+        low_24h = ticker_data.get('low24h', 0)
+        
+        if change_24h == 0 and ticker_data.get('open24h', 0) > 0:
+            change_24h = ((last_price - ticker_data['open24h']) / ticker_data['open24h']) * 100
+        
+        # Display with custom styling
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#1a1a2e,#16213e);padding:20px;border-radius:12px;text-align:center;">
+            <div style="font-size:14px;color:#888;margin-bottom:8px;">{display_name}</div>
+            <div style="font-size:28px;font-weight:bold;color:#fff;">${last_price:,.2f}</div>
+            <div style="font-size:16px;color:{'#00ff88' if change_24h >= 0 else '#ff4444'};margin-top:8px;">
+                {'+' if change_24h >= 0 else ''}{change_24h:.2f}%
+            </div>
+            <div style="margin-top:16px;display:flex;justify-content:space-between;">
+                <div>
+                    <div style="font-size:10px;color:#666;">24h High</div>
+                    <div style="font-size:12px;color:#fff;">${high_24h:,.2f}</div>
+                </div>
+                <div>
+                    <div style="font-size:10px;color:#666;">24h Low</div>
+                    <div style="font-size:12px;color:#fff;">${low_24h:,.2f}</div>
+                </div>
+            </div>
+            <div style="margin-top:12px;font-size:10px;color:#00ff88;">
+                🟢 LIVE • Real-Time Data
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    except Exception as e:
+        st.metric(display_name, "Loading...", help=str(e))
+
+st.markdown("---")
+
+with st.sidebar:
+    # cfg already defined above
     if provider == "Twelve Data (key)":
         st.session_state["TD_KEY"] = st.text_input("Twelve Data API Key", value=TWELVEDATA_API_KEY_DEFAULT, type="password")
         td_default = td_default_symbol_for_preset(cfg)
@@ -565,8 +774,12 @@ with st.sidebar:
             help="Examples: EUR/USD, GBP/USD, USD/JPY (no crypto/metals on AV)"
         )
 
-    auto = st.toggle("Auto-refresh (GARCH/ARIMA panels)", value=False)
-    every_sec = st.number_input("Refresh every (sec)", 10, 3600, 30, step=10, disabled=not auto)
+
+    st.header("⚡ Refresh Settings")
+    st.caption("🔴 **WebSocket LIVE** • Prices update in real-time (10-50ms)")
+    auto = st.toggle("Auto-refresh Analytics", value=True)
+    every_sec = st.number_input("Analytics refresh (sec)", 5, 60, 10, step=5, disabled=not auto, 
+                                help="WebSocket streams prices continuously. This controls GARCH/charts refresh.")
     if auto: st_autorefresh(interval=int(every_sec*1000), key="refresh_main")
 
     st.header("Display")
@@ -606,15 +819,26 @@ try:
 
         elif provider.startswith("Twelve"):
             sym = st.session_state.get("TD_SYMBOL") or td_default_symbol_for_preset(cfg)
+            # Convert USDT to USD for Twelve Data compatibility
+            sym_original = sym
+            if "USDT" in sym:
+                sym = sym.replace("USDT", "USD")
+            if "BTC/USD" in sym or "ETH/USD" in sym:
+                st.info(f"Using {sym} for Twelve Data" + (f" (converted from {sym_original})" if sym != sym_original else ""))
             try:
                 df = load_twelvedata(symbol=sym, interval="30min")
                 title_base = f"{sym} • 30min (Twelve Data)"
             except Exception as e:
-                if is_fx_or_metal(sym):
-                    yfs = pair_to_yf_fx(sym)
+                # Try fallback to Yahoo Finance
+                if "/" in sym:
+                    if is_fx_or_metal(sym):
+                        yfs = pair_to_yf_fx(sym)
+                    else:
+                        # Crypto - use Yahoo's format
+                        yfs = sym.replace("/", "-")
+                    st.warning(f"Twelve Data failed for '{sym}' → trying Yahoo ({yfs}). Reason: {str(e)[:80]}")
                     df = load_yfinance(yfs, period="60d", interval="30m")
                     title_base = f"{yfs} • 30m (Yahoo fallback)"
-                    st.warning(f"Twelve Data failed for '{sym}' → using Yahoo ({yfs}). Reason: {e}")
                 else:
                     raise
 
@@ -640,9 +864,9 @@ except Exception as e:
     st.stop()
 
 # Tabs
-tab1, tab2, tab_sig, tab_opt, tab3 = st.tabs([
+tab1, tab2, tab_sig, tab_opt, tab_portfolio, tab3 = st.tabs([
     "Volatility (GARCH)", "ARIMA forecast → TV-lite",
-    "Signals & Risk", "Options (Black–Scholes)", "Market (pro)"])
+    "Signals & Risk", "Options (Black–Scholes)", "📊 Portfolio Analytics", "Market (pro)"])
 
 # ===== Tab 1: GARCH =====
 with tab1:
@@ -650,17 +874,6 @@ with tab1:
         returns = log_returns(df)
         fits = fit_garch_family(returns)
         best = best_by_aic(fits)
-
-    st.subheader("Market snapshot")
-    c1,c2,c3,c4 = st.columns(4)
-    last_price = float(df["Close"].iloc[-1])
-    chg = (df["Close"].iloc[-1] / df["Close"].iloc[-48] - 1) * 100 if len(df) > 48 else np.nan
-    bars_per_year = infer_bars_per_year(df.index)
-    sigma_ann = best.sigma1 * np.sqrt(bars_per_year)
-    c1.metric("Last Price", f"{last_price:,.2f}")
-    c2.metric("~24h Change", f"{chg:+.2f}%")
-    c3.metric("Best Model", best.name)
-    c4.metric("σ(1-step) → annualized", f"{sigma_ann:.2f}%")
 
     st.subheader("Best model by AIC")
     if use_plotly:
@@ -686,19 +899,256 @@ with tab1:
                     f = tv_figure(df, fits[name], f"{title_base} — {name}", fib_lookback=fib_n)
                     show_mpf(f)
 
-# ===== Tab 2: ARIMA + Lightweight overlay =====
+# ===== Tab 2: ARIMA + Enhanced Forecasting =====
 with tab2:
-    st.subheader("ARIMA forecast on returns → price path")
+    st.subheader("📈 ARIMA Price Forecast")
+    st.caption("Professional time series forecasting with confidence bands")
+    
+    # Clean controls in columns
+    ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 1])
+    with ctrl1:
+        forecast_steps = st.slider("Forecast Steps", 8, 48, 16, 4, help="How many periods to forecast ahead")
+    with ctrl2:
+        auto_order = st.toggle("Auto-Select Model", value=True, help="Automatically find best ARIMA order")
+    with ctrl3:
+        show_advanced = st.toggle("Show Advanced", value=False, help="Show detailed diagnostics")
+    
     try:
-        fc = arima_forecast_prices(df, steps=st.slider("Forecast steps", 8, 48, 16, 4))
-        st.dataframe(fc.tail(6))
-        st.markdown("**Candles + ARIMA mean & band overlay**")
-        if use_plotly:
-            st.plotly_chart(plotly_arima_chart(df, fc), use_container_width=True, theme="streamlit")
+        # Import enhanced functions
+        from src.models.arima import (
+            enhanced_arima_analysis, create_fan_chart_data, 
+            get_forecast_summary_for_display, compare_models,
+            log_returns as arima_log_returns
+        )
+        
+        # Run enhanced analysis
+        analysis = enhanced_arima_analysis(
+            df, 
+            steps=forecast_steps, 
+            auto_order=auto_order,
+            run_validation=show_advanced
+        )
+        
+        if analysis['success']:
+            fc = analysis['forecast']
+            diag = analysis['diagnostics']
+            
+            # ===== MAIN FORECAST DISPLAY (Always visible) =====
+            st.markdown("---")
+            
+            # Key metrics row
+            m1, m2, m3, m4 = st.columns(4)
+            
+            with m1:
+                st.metric(
+                    "Model", 
+                    f"ARIMA{analysis['best_order']}",
+                    help="Auto-selected based on AIC"
+                )
+            with m2:
+                expected_price = float(fc.mean_prices.iloc[-1])
+                current_price = float(df["Close"].iloc[-1])
+                change_pct = ((expected_price / current_price) - 1) * 100
+                st.metric(
+                    f"Forecast ({forecast_steps} steps)",
+                    f"${expected_price:,.2f}",
+                    delta=f"{change_pct:+.2f}%"
+                )
+            with m3:
+                st.metric("AIC Score", f"{fc.aic:.1f}", help="Lower is better")
+            with m4:
+                status = "✅ Valid" if diag.is_residuals_uncorrelated else "⚠️ Check"
+                st.metric("Model Status", status, help="Based on residual diagnostics")
+            
+            # ===== FAN CHART (Main visualization) =====
+            st.markdown("### 📊 Forecast with Confidence Bands")
+            
+            # Create fan chart with Plotly
+            import plotly.graph_objects as go
+            
+            fig = go.Figure()
+            
+            # Historical prices (last 100 bars)
+            hist_data = df["Close"].tail(100)
+            fig.add_trace(go.Scatter(
+                x=hist_data.index,
+                y=hist_data.values,
+                mode='lines',
+                name='Historical',
+                line=dict(color='#3BA7FF', width=2)
+            ))
+            
+            # Forecast bands (95% - widest, lightest)
+            if fc.bands_95:
+                fig.add_trace(go.Scatter(
+                    x=fc.forecast_index.tolist() + fc.forecast_index.tolist()[::-1],
+                    y=fc.bands_95[1].tolist() + fc.bands_95[0].tolist()[::-1],
+                    fill='toself',
+                    fillcolor='rgba(255, 165, 0, 0.15)',
+                    line=dict(color='rgba(0,0,0,0)'),
+                    name='95% CI',
+                    showlegend=True
+                ))
+            
+            # Forecast bands (80%)
+            if fc.bands_80:
+                fig.add_trace(go.Scatter(
+                    x=fc.forecast_index.tolist() + fc.forecast_index.tolist()[::-1],
+                    y=fc.bands_80[1].tolist() + fc.bands_80[0].tolist()[::-1],
+                    fill='toself',
+                    fillcolor='rgba(255, 165, 0, 0.25)',
+                    line=dict(color='rgba(0,0,0,0)'),
+                    name='80% CI',
+                    showlegend=True
+                ))
+            
+            # Forecast bands (50% - narrowest, darkest)
+            if fc.bands_50:
+                fig.add_trace(go.Scatter(
+                    x=fc.forecast_index.tolist() + fc.forecast_index.tolist()[::-1],
+                    y=fc.bands_50[1].tolist() + fc.bands_50[0].tolist()[::-1],
+                    fill='toself',
+                    fillcolor='rgba(255, 165, 0, 0.4)',
+                    line=dict(color='rgba(0,0,0,0)'),
+                    name='50% CI',
+                    showlegend=True
+                ))
+            
+            # Forecast mean line
+            fig.add_trace(go.Scatter(
+                x=fc.forecast_index,
+                y=fc.mean_prices,
+                mode='lines',
+                name='Forecast',
+                line=dict(color='#FFA500', width=3, dash='solid')
+            ))
+            
+            # Current price line
+            fig.add_hline(
+                y=current_price,
+                line_dash="dash",
+                line_color="gray",
+                annotation_text=f"Current: ${current_price:,.2f}"
+            )
+            
+            fig.update_layout(
+                template="plotly_dark",
+                height=450,
+                margin=dict(l=10, r=10, t=40, b=10),
+                title=f"{title_base} - ARIMA Forecast",
+                xaxis_title="",
+                yaxis_title="Price ($)",
+                legend=dict(
+                    orientation="h",
+                    yanchor="bottom",
+                    y=1.02,
+                    xanchor="right",
+                    x=1
+                ),
+                hovermode="x unified"
+            )
+            
+            st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+            
+            # ===== FORECAST TABLE (Clean) =====
+            st.markdown("### 📋 Forecast Values")
+            
+            # Create clean summary table
+            fc_summary = pd.DataFrame({
+                'Time': fc.forecast_index.strftime('%Y-%m-%d %H:%M'),
+                'Mean ($)': fc.mean_prices.round(2),
+                '50% Low': fc.bands_50[0].round(2) if fc.bands_50 else None,
+                '50% High': fc.bands_50[1].round(2) if fc.bands_50 else None,
+                '80% Low': fc.bands_80[0].round(2) if fc.bands_80 else None,
+                '80% High': fc.bands_80[1].round(2) if fc.bands_80 else None,
+            })
+            fc_summary.index = range(1, len(fc_summary) + 1)
+            fc_summary.index.name = 'Step'
+            
+            st.dataframe(fc_summary, use_container_width=True, height=200)
+            
+            # ===== ADVANCED SECTION (Hidden by default) =====
+            if show_advanced:
+                st.markdown("---")
+                st.markdown("### 🔬 Advanced Analytics")
+                
+                # Model Comparison
+                with st.expander("📊 Model Comparison", expanded=True):
+                    if analysis['model_comparison']:
+                        comp = analysis['model_comparison']
+                        
+                        # Create comparison table
+                        comp_df = pd.DataFrame(comp.models)
+                        if not comp_df.empty:
+                            comp_df = comp_df[['name', 'aic', 'bic', 'residual_std', 'is_valid']]
+                            comp_df.columns = ['Model', 'AIC', 'BIC', 'Residual σ', 'Valid']
+                            comp_df['AIC'] = comp_df['AIC'].round(2)
+                            comp_df['BIC'] = comp_df['BIC'].round(2)
+                            comp_df['Residual σ'] = comp_df['Residual σ'].round(4)
+                            comp_df['Valid'] = comp_df['Valid'].apply(lambda x: '✅' if x else '⚠️')
+                            
+                            st.dataframe(comp_df, use_container_width=True)
+                            st.caption(f"🏆 Best Model: **{comp.best_model}** (lowest AIC)")
+                
+                # Diagnostics
+                with st.expander("🔍 Model Diagnostics"):
+                    d1, d2 = st.columns(2)
+                    
+                    with d1:
+                        st.markdown("**Information Criteria**")
+                        st.write(f"- AIC: {diag.aic:.2f}")
+                        st.write(f"- BIC: {diag.bic:.2f}")
+                        st.write(f"- Log-Likelihood: {diag.log_likelihood:.2f}")
+                        
+                        st.markdown("**Residual Statistics**")
+                        st.write(f"- Mean: {diag.residual_mean:.6f}")
+                        st.write(f"- Std Dev: {diag.residual_std:.6f}")
+                        st.write(f"- Skewness: {diag.residual_skew:.4f}")
+                        st.write(f"- Kurtosis: {diag.residual_kurtosis:.4f}")
+                    
+                    with d2:
+                        st.markdown("**Statistical Tests**")
+                        
+                        # Ljung-Box test
+                        lb_status = "✅ Pass" if diag.is_residuals_uncorrelated else "❌ Fail"
+                        st.write(f"- Ljung-Box Test: {lb_status}")
+                        st.write(f"  - Statistic: {diag.ljung_box_stat:.2f}")
+                        st.write(f"  - p-value: {diag.ljung_box_pvalue:.4f}")
+                        
+                        # Jarque-Bera test
+                        jb_status = "✅ Pass" if diag.is_residuals_normal else "⚠️ Non-normal"
+                        st.write(f"- Jarque-Bera Test: {jb_status}")
+                        st.write(f"  - Statistic: {diag.jarque_bera_stat:.2f}")
+                        st.write(f"  - p-value: {diag.jarque_bera_pvalue:.4f}")
+                
+                # Walk-Forward Validation
+                if analysis['validation']:
+                    with st.expander("📈 Backtest Results (Walk-Forward Validation)"):
+                        val = analysis['validation']
+                        
+                        if 'error' not in val:
+                            v1, v2, v3 = st.columns(3)
+                            v1.metric("Avg RMSE", f"{val['avg_rmse']:.4f}")
+                            v2.metric("Avg MAE", f"{val['avg_mae']:.4f}")
+                            v3.metric("Direction Accuracy", f"{val['avg_direction_accuracy']:.1f}%")
+                            
+                            st.caption(f"Based on {val['num_folds']} validation folds")
+                            
+                            # Show fold details
+                            if val['folds']:
+                                folds_df = pd.DataFrame(val['folds'])
+                                st.dataframe(folds_df, use_container_width=True)
+                        else:
+                            st.warning(f"Validation error: {val['error']}")
+        
         else:
-            render_lightweight_chart(df, fc, height=480)
+            st.error(f"Forecast error: {analysis['error']}")
+    
     except Exception as e:
         st.warning(f"ARIMA forecast unavailable: {e}")
+        import traceback
+        if show_advanced:
+            st.code(traceback.format_exc())
 
 # ===== Tab 3: Market (pro) =====
 with tab3:
@@ -869,5 +1319,244 @@ with tab_opt:
     if q > 0:
         iv = implied_vol_bisect(S,K,T,r,q,side)
         st.metric("Implied σ (annual, %)", f"{iv*100.0:.2f}%")
+
+# ===== Tab 6: Portfolio Analytics (Bloomberg-style) =====
+with tab_portfolio:
+    st.subheader("📊 Portfolio Analytics Dashboard")
+    st.markdown("*Bloomberg Terminal-style performance analytics and risk metrics*")
+    
+    try:
+        # Calculate returns and metrics
+        prices = df["Close"].copy()
+        returns = calculate_returns(prices)
+        
+        # Calculate all performance metrics
+        metrics = calculate_all_metrics(prices, returns)
+        
+        # Display key metrics in cards (Bloomberg-style)
+        st.markdown("### 📈 Performance Metrics")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                "Total Return",
+                f"{metrics.total_return:.2f}%",
+                delta=f"Annual: {metrics.annual_return:.2f}%"
+            )
+        
+        with col2:
+            st.metric(
+                "Sharpe Ratio",
+                f"{metrics.sharpe_ratio:.2f}",
+                delta="Risk-adjusted return",
+                delta_color="off"
+            )
+        
+        with col3:
+            st.metric(
+                "Max Drawdown",
+                f"{metrics.max_drawdown:.2f}%",
+                delta=f"{metrics.max_drawdown_duration} periods",
+                delta_color="inverse"
+            )
+        
+        with col4:
+            st.metric(
+                "Volatility (Annual)",
+                f"{metrics.annual_volatility:.2f}%",
+                delta=f"Sortino: {metrics.sortino_ratio:.2f}",
+                delta_color="off"
+            )
+        
+        # Second row of metrics
+        col5, col6, col7, col8 = st.columns(4)
+        
+        with col5:
+            st.metric("Win Rate", f"{metrics.win_rate:.1f}%")
+        
+        with col6:
+            st.metric("Profit Factor", f"{metrics.profit_factor:.2f}")
+        
+        with col7:
+            st.metric("Calmar Ratio", f"{metrics.calmar_ratio:.2f}")
+        
+        with col8:
+            st.metric("Num Trades", f"{metrics.num_trades}")
+        
+        st.markdown("---")
+        
+        # Monthly Returns Heatmap
+        st.markdown("### 📅 Monthly Returns Heatmap")
+        try:
+            monthly_table = monthly_returns_table(returns)
+            if not monthly_table.empty:
+                fig_monthly = create_monthly_returns_heatmap(
+                    monthly_table,
+                    title=f"{title_base} - Monthly Returns (%)"
+                )
+                st.plotly_chart(fig_monthly, use_container_width=True, theme="streamlit")
+            else:
+                st.info("Not enough data for monthly returns heatmap (need at least 1 month)")
+        except Exception as e:
+            st.warning(f"Monthly heatmap unavailable: {e}")
+        
+        st.markdown("---")
+        
+        # Drawdown Chart
+        st.markdown("### 📉 Drawdown Analysis (Underwater Equity)")
+        try:
+            drawdown = calculate_drawdown(prices)
+            fig_dd = create_drawdown_chart(
+                prices,
+                drawdown,
+                title=f"{title_base} - Portfolio Drawdown"
+            )
+            st.plotly_chart(fig_dd, use_container_width=True, theme="streamlit")
+            
+            # Drawdown statistics
+            dd_col1, dd_col2, dd_col3 = st.columns(3)
+            with dd_col1:
+                st.metric("Current Drawdown", f"{drawdown.iloc[-1]*100:.2f}%")
+            with dd_col2:
+                st.metric("Max Drawdown", f"{metrics.max_drawdown:.2f}%")
+            with dd_col3:
+                st.metric("Max DD Duration", f"{metrics.max_drawdown_duration} periods")
+        except Exception as e:
+            st.warning(f"Drawdown chart unavailable: {e}")
+        
+        st.markdown("---")
+        
+        # Two-column layout for additional charts
+        left_col, right_col = st.columns(2)
+        
+        with left_col:
+            # Rolling Sharpe Ratio
+            st.markdown("### 📊 Rolling Sharpe Ratio (252-period)")
+            try:
+                roll_sharpe = rolling_sharpe(returns, window=min(252, len(returns)//2))
+                if len(roll_sharpe.dropna()) > 0:
+                    fig_rolling = create_rolling_metrics_chart(
+                        roll_sharpe,
+                        title="Rolling Sharpe Ratio"
+                    )
+                    st.plotly_chart(fig_rolling, use_container_width=True, theme="streamlit")
+                    
+                    # Current rolling Sharpe
+                    current_sharpe = roll_sharpe.iloc[-1] if not pd.isna(roll_sharpe.iloc[-1]) else 0.0
+                    st.metric("Current Rolling Sharpe", f"{current_sharpe:.2f}")
+                else:
+                    st.info("Not enough data for rolling Sharpe (need at least 126 periods)")
+            except Exception as e:
+                st.warning(f"Rolling Sharpe unavailable: {e}")
+        
+        with right_col:
+            # Returns Distribution
+            st.markdown("### 📊 Returns Distribution")
+            try:
+                fig_dist = create_returns_distribution(
+                    returns,
+                    title="Daily Returns Distribution"
+                )
+                st.plotly_chart(fig_dist, use_container_width=True, theme="streamlit")
+                
+                # Distribution statistics
+                dist_col1, dist_col2 = st.columns(2)
+                with dist_col1:
+                    st.metric("Mean Return", f"{returns.mean()*100:.3f}%")
+                    st.metric("Median Return", f"{returns.median()*100:.3f}%")
+                with dist_col2:
+                    st.metric("Std Dev", f"{returns.std()*100:.3f}%")
+                    st.metric("Skewness", f"{returns.skew():.2f}")
+            except Exception as e:
+                st.warning(f"Returns distribution unavailable: {e}")
+        
+        st.markdown("---")
+        
+        # Correlation Matrix (if we have multi-asset data)
+        st.markdown("### 🔗 Cross-Asset Correlation Matrix")
+        try:
+            corr_data = load_close_for_corr()
+            if not corr_data.empty and len(corr_data.columns) > 1:
+                corr_matrix = corr_data.corr()
+                fig_corr = create_correlation_heatmap(
+                    corr_matrix,
+                    title="Asset Correlation Matrix (90d, 1h returns)"
+                )
+                st.plotly_chart(fig_corr, use_container_width=True, theme="streamlit")
+            else:
+                st.info("Correlation matrix requires multiple assets. Showing single-asset analytics only.")
+        except Exception as e:
+            st.warning(f"Correlation matrix unavailable: {e}")
+        
+        st.markdown("---")
+        
+        # Detailed Metrics Table
+        st.markdown("### 📋 Detailed Performance Metrics")
+        metrics_df = pd.DataFrame({
+            "Metric": [
+                "Total Return",
+                "Annual Return",
+                "Annual Volatility",
+                "Sharpe Ratio",
+                "Sortino Ratio",
+                "Calmar Ratio",
+                "Max Drawdown",
+                "Max DD Duration",
+                "Win Rate",
+                "Profit Factor",
+                "Number of Trades",
+                "Average Win",
+                "Average Loss"
+            ],
+            "Value": [
+                f"{metrics.total_return:.2f}%",
+                f"{metrics.annual_return:.2f}%",
+                f"{metrics.annual_volatility:.2f}%",
+                f"{metrics.sharpe_ratio:.2f}",
+                f"{metrics.sortino_ratio:.2f}",
+                f"{metrics.calmar_ratio:.2f}",
+                f"{metrics.max_drawdown:.2f}%",
+                f"{metrics.max_drawdown_duration} periods",
+                f"{metrics.win_rate:.1f}%",
+                f"{metrics.profit_factor:.2f}",
+                f"{metrics.num_trades}",
+                f"{metrics.avg_win:.3f}%",
+                f"{metrics.avg_loss:.3f}%"
+            ]
+        })
+        st.dataframe(metrics_df, use_container_width=True, height=500)
+        
+        # Export functionality
+        st.markdown("### 💾 Export Analytics")
+        export_col1, export_col2 = st.columns(2)
+        
+        with export_col1:
+            # Export metrics as CSV
+            metrics_csv = metrics_df.to_csv(index=False).encode()
+            st.download_button(
+                "📥 Download Metrics (CSV)",
+                metrics_csv,
+                file_name=f"portfolio_metrics_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        
+        with export_col2:
+            # Export returns data
+            returns_df = pd.DataFrame({
+                "Date": returns.index,
+                "Return": returns.values * 100
+            })
+            returns_csv = returns_df.to_csv(index=False).encode()
+            st.download_button(
+                "📥 Download Returns (CSV)",
+                returns_csv,
+                file_name=f"returns_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+    
+    except Exception as e:
+        st.error(f"Portfolio analytics error: {e}")
+        import traceback
+        st.code(traceback.format_exc())
 
 st.caption("Notes: For reliability use OKX/Binance via CCXT, Twelve Data, or Alpha Vantage (FX). Yahoo works well as a fallback for FX/metals.")

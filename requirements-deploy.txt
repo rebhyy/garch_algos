@@ -1,0 +1,41 @@
+# ========================================
+# GARCH ALGO INTELLIGENCE PLATFORM
+# Production Requirements for Deployment
+# ========================================
+
+# Core Web Framework
+streamlit>=1.29.0
+streamlit-autorefresh>=1.0.1
+
+# Data Manipulation & Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Financial Data Providers
+yfinance>=0.2.30
+ccxt>=4.0.0
+requests>=2.31.0
+
+# Time Series & Econometric Models
+arch>=6.0.0
+statsmodels>=0.14.0
+
+# Visualization
+matplotlib>=3.7.0
+mplfinance>=0.12.10b0
+plotly>=5.15.0
+
+# Technical Analysis
+ta>=0.10.0
+
+# Environment & Configuration
+python-dotenv>=1.0.0
+
+# HTTP & API
+httpx>=0.25.0
+
+# WebSocket for real-time data
+websocket-client>=1.6.0
+
+# Scientific Computing
+scipy>=1.11.0
